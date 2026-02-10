@@ -2,22 +2,17 @@
 import { computed, ref, h, onMounted, onBeforeUnmount, useTemplateRef } from 'vue';
 import type { VNode } from 'vue';
 import Modal from '@/app/components/Modal.vue';
-import {
-	WORKFLOW_PUBLISH_MODAL_KEY,
-	WORKFLOW_ACTIVATION_CONFLICTING_WEBHOOK_MODAL_KEY,
-} from '@/app/constants';
+import { WORKFLOW_PUBLISH_MODAL_KEY } from '@/app/constants';
 import { telemetry } from '@/app/plugins/telemetry';
 import { useWorkflowsStore } from '@/app/stores/workflows.store';
 import { createEventBus } from '@n8n/utils/event-bus';
 import { useI18n } from '@n8n/i18n';
-import { N8nHeading, N8nCallout, N8nButton } from '@n8n/design-system';
-import WorkflowPublishForm from '@/app/components/WorkflowPublishForm.vue';
+import { N8nHeading, N8nCallout, N8nButton, N8nLink } from '@n8n/design-system';
+import WorkflowVersionForm from '@/app/components/WorkflowVersionForm.vue';
 import { getActivatableTriggerNodes } from '@/app/utils/nodeTypesUtils';
 import { useToast } from '@/app/composables/useToast';
 import { useWorkflowActivate } from '@/app/composables/useWorkflowActivate';
-import { useWorkflowHelpers } from '@/app/composables/useWorkflowHelpers';
 import { useCredentialsStore } from '@/features/credentials/credentials.store';
-import { useUIStore } from '@/app/stores/ui.store';
 import { OPEN_AI_API_CREDENTIAL_TYPE } from 'n8n-workflow';
 import type { INodeUi } from '@/Interface';
 import type { IUsedCredential } from '@/features/credentials/credentials.types';
@@ -29,12 +24,11 @@ const i18n = useI18n();
 
 const workflowsStore = useWorkflowsStore();
 const credentialsStore = useCredentialsStore();
-const uiStore = useUIStore();
 const { showMessage } = useToast();
 const workflowActivate = useWorkflowActivate();
-const workflowHelpers = useWorkflowHelpers();
+const publishing = ref(false);
 
-const publishForm = useTemplateRef<InstanceType<typeof WorkflowPublishForm>>('publishForm');
+const publishForm = useTemplateRef<InstanceType<typeof WorkflowVersionForm>>('publishForm');
 
 const description = ref('');
 const versionName = ref('');
@@ -54,7 +48,9 @@ const wfHasAnyChanges = computed(() => {
 const hasNodeIssues = computed(() => workflowsStore.nodesIssuesExist);
 
 const inputsDisabled = computed(() => {
-	return !wfHasAnyChanges.value || !containsTrigger.value || hasNodeIssues.value;
+	return (
+		!wfHasAnyChanges.value || !containsTrigger.value || hasNodeIssues.value || publishing.value
+	);
 });
 
 const isPublishDisabled = computed(() => {
@@ -84,9 +80,20 @@ function onModalOpened() {
 }
 
 onMounted(() => {
-	if (!versionName.value && !inputsDisabled.value) {
-		versionName.value = generateVersionName(workflowsStore.workflow.versionId);
+	const versionData = workflowsStore.versionData;
+
+	if (!versionName.value) {
+		if (versionData?.name) {
+			versionName.value = versionData.name;
+		} else {
+			versionName.value = generateVersionName(workflowsStore.workflow.versionId);
+		}
 	}
+
+	if (!description.value && versionData?.description) {
+		description.value = versionData.description;
+	}
+
 	modalBus.on('opened', onModalOpened);
 });
 
@@ -162,27 +169,10 @@ async function handlePublish() {
 		return;
 	}
 
-	// Check for conflicting webhooks before activating
-	const conflictData = await workflowHelpers.checkConflictingWebhooks(workflowsStore.workflow.id);
-
-	if (conflictData) {
-		const { trigger, conflict } = conflictData;
-		const conflictingWorkflow = await workflowsStore.fetchWorkflow(conflict.workflowId);
-
-		uiStore.openModalWithData({
-			name: WORKFLOW_ACTIVATION_CONFLICTING_WEBHOOK_MODAL_KEY,
-			data: {
-				triggerType: trigger.type,
-				workflowName: conflictingWorkflow.name,
-				...conflict,
-			},
-		});
-
-		return;
-	}
+	publishing.value = true;
 
 	// Activate the workflow
-	const success = await workflowActivate.publishWorkflow(
+	const { success, errorHandled } = await workflowActivate.publishWorkflow(
 		workflowsStore.workflow.id,
 		workflowsStore.workflow.versionId,
 		{
@@ -192,6 +182,12 @@ async function handlePublish() {
 	);
 
 	if (success) {
+		workflowsStore.setWorkflowVersionData({
+			versionId: workflowsStore.workflow.versionId,
+			name: versionName.value,
+			description: description.value,
+		});
+
 		// Show AI credits warning if applicable
 		if (shouldShowFreeAiCreditsWarning.value) {
 			showMessage({
@@ -210,8 +206,12 @@ async function handlePublish() {
 		modalBus.emit('close');
 	} else {
 		// Display activation error if it fails
-		await displayActivationError();
+		if (!errorHandled) {
+			await displayActivationError();
+		}
 	}
+
+	publishing.value = false;
 }
 </script>
 
@@ -222,6 +222,7 @@ async function handlePublish() {
 		:name="WORKFLOW_PUBLISH_MODAL_KEY"
 		:center="true"
 		:show-close="true"
+		:close-on-click-modal="false"
 		:event-bus="modalBus"
 	>
 		<template #header>
@@ -233,20 +234,27 @@ async function handlePublish() {
 					{{ i18n.baseText('workflows.publishModal.noTriggerMessage') }}
 				</N8nCallout>
 				<N8nCallout v-else-if="activeCalloutId === 'nodeIssues'" theme="danger" icon="status-error">
-					<strong>
-						{{
-							i18n.baseText('workflowActivator.showMessage.activeChangedNodesIssuesExistTrue.title')
-						}}
-					</strong>
-					<br />
 					{{
-						i18n.baseText('workflowActivator.showMessage.activeChangedNodesIssuesExistTrue.message')
+						i18n.baseText('workflowActivator.showMessage.activeChangedNodesIssuesExistTrue.title', {
+							interpolate: { count: workflowsStore.nodesWithIssues.length },
+							adjustToNumber: workflowsStore.nodesWithIssues.length,
+						})
 					}}
+					<ul :class="$style.nodeLinks">
+						<li v-for="node in workflowsStore.nodesWithIssues" :key="node.id">
+							<N8nLink
+								size="small"
+								:to="`/workflow/${workflowsStore.workflow.id}/${node.id}`"
+								@click="modalBus.emit('close')"
+								>{{ node.name }}</N8nLink
+							>
+						</li>
+					</ul>
 				</N8nCallout>
 				<N8nCallout v-else-if="activeCalloutId === 'noChanges'" theme="warning">
 					{{ i18n.baseText('workflows.publishModal.noChanges') }}
 				</N8nCallout>
-				<WorkflowPublishForm
+				<WorkflowVersionForm
 					ref="publishForm"
 					v-model:version-name="versionName"
 					v-model:description="description"
@@ -257,6 +265,7 @@ async function handlePublish() {
 				/>
 				<div :class="$style.actions">
 					<N8nButton
+						:disabled="publishing"
 						type="secondary"
 						:label="i18n.baseText('generic.cancel')"
 						data-test-id="workflow-publish-cancel-button"
@@ -264,6 +273,7 @@ async function handlePublish() {
 					/>
 					<N8nButton
 						:disabled="isPublishDisabled"
+						:loading="publishing"
 						:label="i18n.baseText('workflows.publish')"
 						data-test-id="workflow-publish-button"
 						@click="handlePublish"
@@ -285,5 +295,20 @@ async function handlePublish() {
 	display: flex;
 	justify-content: flex-end;
 	gap: var(--spacing--xs);
+}
+
+.nodeLinks {
+	list-style-type: disc;
+	margin-top: var(--spacing--4xs);
+	padding-left: var(--spacing--sm);
+}
+
+.nodeLinks li {
+	margin-bottom: var(--spacing--4xs);
+}
+
+.nodeLinks a span {
+	text-decoration: underline;
+	color: var(--callout--color--text--danger);
 }
 </style>
