@@ -5,14 +5,17 @@ import CredentialSharing from './CredentialSharing.ee.vue';
 import { useUsersStore } from '@/features/settings/users/users.store';
 import { useProjectsStore } from '@/features/collaboration/projects/projects.store';
 import { useSettingsStore } from '@/app/stores/settings.store';
-import { useRolesStore } from '@/app/stores/roles.store';
+import { useRolesStore } from '@n8n/stores/roles.store';
 import type { ICredentialsResponse } from '../../credentials.types';
 import { createEventBus } from '@n8n/utils/event-bus';
 import { getDropdownItems } from '@/__tests__/utils';
 import { useI18n } from '@n8n/i18n';
 import type * as I18nModule from '@n8n/i18n';
 import { ProjectTypes } from '@/features/collaboration/projects/projects.types';
-import { createTestProject } from '@/features/collaboration/projects/__tests__/utils';
+import {
+	createProjectListItem,
+	createTestProject,
+} from '@/features/collaboration/projects/__tests__/utils';
 
 vi.mock('@n8n/i18n', async (importOriginal) => {
 	const actual = await importOriginal<typeof I18nModule>();
@@ -52,6 +55,7 @@ const mockBaseText = vi.fn((key: string, options?: { interpolate?: Record<string
 });
 
 const renderComponent = createComponentRenderer(CredentialSharing);
+const testProjects = Array.from({ length: 3 }, createProjectListItem);
 
 const createCredential = (overrides = {}): ICredentialsResponse => ({
 	id: '1',
@@ -96,6 +100,10 @@ describe('CredentialSharing.ee', () => {
 		// Mock store methods
 		vi.spyOn(usersStore, 'fetchUsers').mockResolvedValue();
 		vi.spyOn(projectsStore, 'getAllProjects').mockResolvedValue();
+		vi.spyOn(projectsStore, 'searchShareableProjects').mockResolvedValue({
+			count: testProjects.length,
+			data: testProjects,
+		});
 		vi.spyOn(rolesStore, 'processedCredentialRoles', 'get').mockReturnValue([
 			{
 				slug: 'credential:user',
@@ -125,7 +133,7 @@ describe('CredentialSharing.ee', () => {
 				binaryDataS3: false,
 				workerView: false,
 				advancedPermissions: false,
-				apiKeyScopes: false,
+
 				workflowDiffs: false,
 				namedVersions: false,
 				provisioning: true,
@@ -136,6 +144,10 @@ describe('CredentialSharing.ee', () => {
 					},
 				},
 				customRoles: false,
+				personalSpacePolicy: false,
+				dataRedaction: false,
+				otelCustomSpanAttributes: false,
+				workflowReviews: false,
 			});
 	});
 
@@ -269,7 +281,7 @@ describe('CredentialSharing.ee', () => {
 				binaryDataS3: false,
 				workerView: false,
 				advancedPermissions: false,
-				apiKeyScopes: false,
+
 				workflowDiffs: false,
 				provisioning: true,
 				showNonProdBanner: false,
@@ -279,6 +291,8 @@ describe('CredentialSharing.ee', () => {
 					},
 				},
 				customRoles: false,
+				personalSpacePolicy: false,
+				dataRedaction: false,
 			});
 
 			const credential = createCredential();
@@ -318,9 +332,9 @@ describe('CredentialSharing.ee', () => {
 	});
 
 	describe('personal space restriction message', () => {
-		it('should show personal space restriction message when in personal space and lacking share permission', () => {
-			// Set current project as personal project
-			projectsStore.currentProject = createTestProject({
+		it('should show owner message and disabled tooltip when in personal space and lacking share permission', () => {
+			// Set personal project
+			projectsStore.personalProject = createTestProject({
 				id: 'personal-project-id',
 				type: ProjectTypes.Personal,
 			});
@@ -336,7 +350,7 @@ describe('CredentialSharing.ee', () => {
 				},
 			});
 
-			const { getByText } = renderComponent({
+			const { getByText, getByTestId } = renderComponent({
 				props: {
 					credentialId: credential.id,
 					credentialData: {},
@@ -346,9 +360,10 @@ describe('CredentialSharing.ee', () => {
 				},
 			});
 
-			expect(
-				getByText("You don't have permission to share personal credentials"),
-			).toBeInTheDocument();
+			// Should show owner info tip instead of restriction message
+			expect(getByText(/can change who this credential is shared with/)).toBeInTheDocument();
+			// Should show disabled select with tooltip
+			expect(getByTestId('project-sharing-select')).toBeInTheDocument();
 		});
 
 		it('should show sharee message when not in personal space and lacking share permission', () => {
@@ -381,6 +396,26 @@ describe('CredentialSharing.ee', () => {
 
 			// Team project shows the team sharee message
 			expect(getByText(/shared by team project/i)).toBeInTheDocument();
+		});
+	});
+
+	describe('dynamic credentials', () => {
+		it('should allow sharing a private credential', () => {
+			const credential = createCredential();
+			const { queryByText, getByTestId } = renderComponent({
+				props: {
+					credentialId: credential.id,
+					credentialData: {},
+					credentialPermissions: { share: true },
+					credential,
+					modalBus: createEventBus(),
+				},
+			});
+
+			// Sharing is no longer blocked: the add-share input is available...
+			expect(getByTestId('project-sharing-select')).toBeInTheDocument();
+			// ...and no "not supported" notice is shown
+			expect(queryByText(/not supported/i)).not.toBeInTheDocument();
 		});
 	});
 });

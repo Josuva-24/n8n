@@ -21,7 +21,13 @@ import { usePageRedirectionHelper } from '@/app/composables/usePageRedirectionHe
 import { useSSOStore } from '../sso.store';
 
 import { ElTable, ElTableColumn } from 'element-plus';
-import { N8nActionBox, N8nButton, N8nFormInputs, N8nHeading, N8nInfoTip } from '@n8n/design-system';
+import {
+	N8nEmptyState,
+	N8nButton,
+	N8nFormInputs,
+	N8nHeading,
+	N8nInfoTip,
+} from '@n8n/design-system';
 type TableRow = {
 	status: string;
 	startAt: string;
@@ -631,7 +637,7 @@ onMounted(async () => {
 		<N8nInfoTip type="note" theme="info" tooltip-placement="right" class="mb-l">
 			{{ i18n.baseText('settings.ldap.note') }}
 		</N8nInfoTip>
-		<N8nActionBox
+		<N8nEmptyState
 			:description="i18n.baseText('settings.ldap.disabled.description')"
 			:button-text="i18n.baseText('settings.ldap.disabled.buttonText')"
 			@click:button="goToUpgrade"
@@ -639,7 +645,7 @@ onMounted(async () => {
 			<template #heading>
 				<span>{{ i18n.baseText('settings.ldap.disabled.title') }}</span>
 			</template>
-		</N8nActionBox>
+		</N8nEmptyState>
 	</div>
 	<div v-else>
 		<div :class="$style.container">
@@ -666,7 +672,7 @@ onMounted(async () => {
 					@submit="onSubmit"
 				/>
 			</div>
-			<div>
+			<div :class="$style.buttonContainer">
 				<N8nButton
 					v-if="loginEnabled"
 					:label="
@@ -732,10 +738,10 @@ onMounted(async () => {
 					</template>
 				</ElTable>
 			</div>
-			<div class="pb-3xl">
+			<div :class="['pb-3xl', $style.buttonContainer]">
 				<N8nButton
+					variant="subtle"
 					:label="i18n.baseText('settings.ldap.dryRun')"
-					type="secondary"
 					size="large"
 					class="mr-s"
 					:disabled="hasAnyChanges || !readyToSubmit"
@@ -804,5 +810,11 @@ onMounted(async () => {
 	& > div {
 		margin-bottom: var(--spacing--xl);
 	}
+}
+
+.buttonContainer {
+	display: flex;
+	align-items: center;
+	justify-content: start;
 }
 </style>

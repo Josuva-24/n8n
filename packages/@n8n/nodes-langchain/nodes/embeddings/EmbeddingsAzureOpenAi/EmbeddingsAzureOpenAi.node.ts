@@ -1,5 +1,5 @@
 import { AzureOpenAIEmbeddings } from '@langchain/openai';
-import { getProxyAgent, logWrapper } from '@n8n/ai-utilities';
+import { getProxyAgent, logWrapper, getConnectionHintNoticeField } from '@n8n/ai-utilities';
 import {
 	NodeConnectionTypes,
 	type INodeType,
@@ -7,8 +7,6 @@ import {
 	type ISupplyDataFunctions,
 	type SupplyData,
 } from 'n8n-workflow';
-
-import { getConnectionHintNoticeField } from '@utils/sharedFields';
 
 export class EmbeddingsAzureOpenAi implements INodeType {
 	description: INodeTypeDescription = {
@@ -89,7 +87,7 @@ export class EmbeddingsAzureOpenAi implements INodeType {
 					{
 						displayName: 'Dimensions',
 						name: 'dimensions',
-						default: undefined,
+						default: 1536,
 						description:
 							'The number of dimensions the resulting output embeddings should have. Only supported in text-embedding-3 and later models.',
 						type: 'options',

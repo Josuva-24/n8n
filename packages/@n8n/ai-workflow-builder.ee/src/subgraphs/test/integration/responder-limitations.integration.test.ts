@@ -26,11 +26,11 @@ describe('Responder Limitations - Integration Tests (AI-1894)', () => {
 	const skipTests = !shouldRunIntegrationTests();
 
 	// Set default timeout for all tests in this suite
-	jest.setTimeout(120000); // 2 minutes
+	vi.setConfig({ testTimeout: 120000 }); // 2 minutes
 
 	beforeAll(async () => {
 		// Override console.log to use process.stdout directly
-		jest.spyOn(console, 'log').mockImplementation((...args: unknown[]) => {
+		vi.spyOn(console, 'log').mockImplementation((...args: unknown[]) => {
 			process.stdout.write(args.map(String).join(' ') + '\n');
 		});
 
@@ -61,7 +61,7 @@ describe('Responder Limitations - Integration Tests (AI-1894)', () => {
 
 			const responderAgent = createResponderAgent({ llm });
 
-			const response = await invokeResponderAgent(responderAgent, {
+			const { response } = await invokeResponderAgent(responderAgent, {
 				messages: [
 					new HumanMessage({
 						content: 'Can you search the web for information about Slack API rate limits?',
@@ -116,7 +116,7 @@ describe('Responder Limitations - Integration Tests (AI-1894)', () => {
 
 			const responderAgent = createResponderAgent({ llm });
 
-			const response = await invokeResponderAgent(responderAgent, {
+			const { response } = await invokeResponderAgent(responderAgent, {
 				messages: [
 					new HumanMessage({
 						content:
@@ -165,7 +165,7 @@ describe('Responder Limitations - Integration Tests (AI-1894)', () => {
 
 			const responderAgent = createResponderAgent({ llm });
 
-			const response = await invokeResponderAgent(responderAgent, {
+			const { response } = await invokeResponderAgent(responderAgent, {
 				messages: [
 					new HumanMessage({
 						content: 'What is the current Bitcoin price?',

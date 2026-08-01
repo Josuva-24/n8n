@@ -2,7 +2,7 @@
 import { useDocumentTitle } from '@/app/composables/useDocumentTitle';
 import { useI18n } from '@n8n/i18n';
 import { useMessage } from '@/app/composables/useMessage';
-import { useTelemetry } from '@/app/composables/useTelemetry';
+import { useTelemetry } from '@n8n/composables/useTelemetry';
 import { useToast } from '@/app/composables/useToast';
 import { useSettingsStore } from '@/app/stores/settings.store';
 import { useUIStore } from '@/app/stores/ui.store';
@@ -18,7 +18,7 @@ import { EnterpriseEditionFeature, MODAL_CONFIRM } from '@/app/constants';
 import { VARIABLE_MODAL_KEY } from '@/features/settings/environments.ee/environments.constants';
 import { getResourcePermissions } from '@n8n/permissions';
 import {
-	N8nActionBox,
+	N8nEmptyState,
 	N8nBadge,
 	N8nButton,
 	N8nCheckbox,
@@ -382,11 +382,11 @@ onMounted(() => {
 			</div>
 		</template>
 		<template v-if="!isFeatureEnabled" #preamble>
-			<N8nActionBox class="mb-m" v-bind="unavailableNoticeProps" />
+			<N8nEmptyState class="mb-m" v-bind="unavailableNoticeProps" />
 		</template>
 		<template v-if="!isFeatureEnabled || (isFeatureEnabled && !canCreateVariables)" #empty>
-			<N8nActionBox v-if="!isFeatureEnabled" v-bind="unavailableNoticeProps" />
-			<N8nActionBox
+			<N8nEmptyState v-if="!isFeatureEnabled" v-bind="unavailableNoticeProps" />
+			<N8nEmptyState
 				v-else-if="!canCreateVariables"
 				data-test-id="cannot-create-variables"
 				:heading="
@@ -426,8 +426,9 @@ onMounted(() => {
 							placement="top"
 						>
 							<N8nButton
+								variant="subtle"
+								size="small"
 								data-test-id="variable-row-edit-button"
-								type="tertiary"
 								class="mr-xs"
 								:disabled="!(globalPermissions.update ?? projectPermissions.update)"
 								@click="openEditVariableModal(data)"
@@ -443,8 +444,9 @@ onMounted(() => {
 							placement="top"
 						>
 							<N8nButton
+								variant="subtle"
+								size="small"
 								data-test-id="variable-row-delete-button"
-								type="tertiary"
 								:disabled="!(globalPermissions.delete ?? projectPermissions.delete)"
 								@click="handleDeleteVariable(data)"
 							>
@@ -479,6 +481,8 @@ onMounted(() => {
 	padding: 2px;
 }
 .action-buttons {
+	display: flex;
+	justify-content: end;
 	opacity: 0;
 	transition: opacity 0.2s ease;
 }

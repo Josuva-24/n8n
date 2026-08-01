@@ -9,7 +9,7 @@ import { DATA_TABLE_COLUMN_TYPES } from '@/features/core/dataTable/dataTable.typ
 import { useI18n } from '@n8n/i18n';
 import { useDataTableTypes } from '@/features/core/dataTable/composables/useDataTableTypes';
 import { COLUMN_NAME_REGEX, MAX_COLUMN_NAME_LENGTH } from '@/features/core/dataTable/constants';
-import { useDebounce } from '@/app/composables/useDebounce';
+import { useDebounce } from '@n8n/composables/useDebounce';
 
 import {
 	N8nButton,
@@ -154,8 +154,8 @@ const onInput = debounce(validateName, { debounceTime: 100 });
 				<template #trigger>
 					<template v-if="props.useTextTrigger">
 						<N8nButton
+							variant="subtle"
 							data-test-id="data-table-add-column-trigger-button"
-							type="tertiary"
 							:disabled="isDisabled"
 						>
 							{{ i18n.baseText('dataTable.addColumn.label') }}
@@ -163,10 +163,10 @@ const onInput = debounce(validateName, { debounceTime: 100 });
 					</template>
 					<template v-else>
 						<N8nIconButton
+							variant="ghost"
 							data-test-id="data-table-add-column-trigger-button"
-							text
 							icon="plus"
-							type="tertiary"
+							:aria-label="i18n.baseText('dataTable.addColumn.label')"
 							:disabled="isDisabled"
 						/>
 					</template>
@@ -234,8 +234,8 @@ const onInput = debounce(validateName, { debounceTime: 100 });
 								</N8nSelect>
 							</N8nInputLabel>
 							<N8nButton
+								variant="solid"
 								data-test-id="data-table-add-column-submit-button"
-								type="primary"
 								class="mt-m"
 								size="large"
 								:disabled="!columnName || !columnType || !!error"

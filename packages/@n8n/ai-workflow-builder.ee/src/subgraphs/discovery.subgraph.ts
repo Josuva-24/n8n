@@ -11,6 +11,11 @@ import { ChatPromptTemplate } from '@langchain/core/prompts';
 import type { Runnable, RunnableConfig } from '@langchain/core/runnables';
 import { tool, type StructuredTool } from '@langchain/core/tools';
 import { Annotation, END, START, StateGraph, type BaseCheckpointSaver } from '@langchain/langgraph';
+import {
+	createResourceCacheKey,
+	extractResourceOperations,
+	type ResourceOperationInfo,
+} from '@n8n/ai-utilities/node-catalog';
 import type { Logger } from '@n8n/backend-common';
 import type { INodeTypeDescription } from 'n8n-workflow';
 import { z } from 'zod';
@@ -20,9 +25,19 @@ import { LLMServiceError } from '@/errors';
 import type { ParentGraphState } from '@/parent-graph-state';
 import { buildDiscoveryPrompt } from '@/prompts';
 import { createGetDocumentationTool } from '@/tools/get-documentation.tool';
-import { createGetWorkflowExamplesTool } from '@/tools/get-workflow-examples.tool';
+import {
+	createIntrospectTool,
+	extractIntrospectionEventsFromMessages,
+} from '@/tools/introspect.tool';
 import { createNodeSearchTool } from '@/tools/node-search.tool';
 import { submitQuestionsTool } from '@/tools/submit-questions.tool';
+import { createPassthroughSsrfGuard, type SsrfGuard } from '@/tools/utils/ssrf-guard';
+import {
+	createLangGraphSecurityManagerFactory,
+	createMutableSecurityManagerFactory,
+	type MutableWebFetchState,
+} from '@/tools/utils/web-fetch-security';
+import { createWebFetchTool } from '@/tools/web-fetch.tool';
 import type { CoordinationLogEntry } from '@/types/coordination';
 import { createDiscoveryMetadata } from '@/types/coordination';
 import type { DiscoveryContext } from '@/types/discovery-types';
@@ -30,14 +45,17 @@ import type { PlanDecision, PlanOutput } from '@/types/planning';
 import type { WorkflowMetadata } from '@/types/tools';
 import type { SimpleWorkflow } from '@/types/workflow';
 import { applySubgraphCacheMarkers } from '@/utils/cache-control';
-import { buildWorkflowSummary, createContextMessage } from '@/utils/context-builders';
 import {
-	createResourceCacheKey,
-	extractResourceOperations,
-	type ResourceOperationInfo,
-} from '@/utils/resource-operation-extractor';
+	buildWorkflowSummary,
+	buildSelectedNodesSummary,
+	createContextMessage,
+} from '@/utils/context-builders';
 import { appendArrayReducer, cachedTemplatesReducer } from '@/utils/state-reducers';
-import { executeSubgraphTools, extractUserRequest } from '@/utils/subgraph-helpers';
+import {
+	executeSubgraphTools,
+	extractUserRequest,
+	extractToolMessagesForPersistence,
+} from '@/utils/subgraph-helpers';
 import type { BuilderFeatureFlags } from '@/workflow-builder-agent';
 
 import { BaseSubgraph } from './subgraph-interface';
@@ -182,10 +200,42 @@ export const DiscoverySubgraphState = Annotation.Root({
 		default: () => ({}),
 	}),
 
+	// Selected nodes context for planner (built from workflowContext.selectedNodes)
+	selectedNodesContext: Annotation<string>({
+		reducer: (x, y) => y ?? x,
+		default: () => '',
+	}),
+
 	// Retry count for when LLM fails to use tool calls properly
 	toolCallRetryCount: Annotation<number>({
 		reducer: (x, y) => y ?? x,
 		default: () => 0,
+	}),
+
+	// Web Fetch: Per-session approved domains
+	approvedDomains: Annotation<string[]>({
+		reducer: (x, y) => [...new Set([...x, ...y])],
+		default: () => [],
+	}),
+
+	// Web Fetch: Whether all domains are approved
+	allDomainsApproved: Annotation<boolean>({
+		reducer: (x, y) => y ?? x,
+		default: () => false,
+	}),
+
+	// Web Fetch: Per-turn fetch count
+	webFetchCount: Annotation<number>({
+		reducer: (_x, y) => y,
+		default: () => 0,
+	}),
+
+	// Web Fetch: Accumulated fetched URL content (success + error)
+	fetchedUrlContent: Annotation<
+		Array<{ url: string; status: 'success' | 'error'; title: string; content: string }>
+	>({
+		reducer: (x, y) => x.concat(y),
+		default: () => [],
 	}),
 });
 
@@ -197,6 +247,8 @@ export interface DiscoverySubgraphConfig {
 	featureFlags?: BuilderFeatureFlags;
 	/** Optional checkpointer for interrupt/resume support (used in integration tests) */
 	checkpointer?: BaseCheckpointSaver;
+	/** SSRF guard for web_fetch. Defaults to a passthrough guard when omitted. */
+	ssrf?: SsrfGuard;
 }
 
 export class DiscoverySubgraph extends BaseSubgraph<
@@ -212,30 +264,42 @@ export class DiscoverySubgraph extends BaseSubgraph<
 	private toolMap!: Map<string, StructuredTool>;
 	private logger?: Logger;
 	private parsedNodeTypes!: INodeTypeDescription[];
-	private featureFlags?: BuilderFeatureFlags;
+
+	/** Mutable state for planner web_fetch hooks, updated before each planner invocation */
+	private plannerWebFetchState: MutableWebFetchState = {
+		approvedDomains: [],
+		allDomainsApproved: false,
+		webFetchCount: 0,
+		messages: [],
+	};
 
 	create(config: DiscoverySubgraphConfig) {
 		this.logger = config.logger;
 		this.parsedNodeTypes = config.parsedNodeTypes;
-		this.featureFlags = config.featureFlags;
 
 		// Check feature flags
-		const includeExamples = config.featureFlags?.templateExamples === true;
-		const includePlanMode = config.featureFlags?.planMode === true;
+		const enableIntrospection = config.featureFlags?.enableIntrospection === true;
+
+		// Create security manager factories for web_fetch in each context
+		const discoverySecurityFactory = createLangGraphSecurityManagerFactory();
+		const plannerSecurityFactory = createMutableSecurityManagerFactory(this.plannerWebFetchState);
+
+		// SSRF guard for web_fetch; passthrough when SSRF protection is disabled/unset.
+		const ssrf = config.ssrf ?? createPassthroughSsrfGuard();
 
 		// Create base tools - search_nodes provides all data needed for discovery
-		const baseTools = includePlanMode
-			? [createNodeSearchTool(config.parsedNodeTypes).tool, submitQuestionsTool]
-			: [createNodeSearchTool(config.parsedNodeTypes).tool];
+		const baseTools: StructuredTool[] = [
+			createNodeSearchTool(config.parsedNodeTypes).tool,
+			submitQuestionsTool,
+			createWebFetchTool(discoverySecurityFactory, ssrf).tool,
+		];
 
-		// Conditionally add documentation and workflow examples tools if feature flag is enabled
-		const tools = includeExamples
-			? [
-					...baseTools,
-					createGetDocumentationTool().tool,
-					createGetWorkflowExamplesTool(config.logger).tool,
-				]
-			: baseTools;
+		// Conditionally add introspect tool if feature flag is enabled
+		if (enableIntrospection) {
+			baseTools.push(createIntrospectTool(config.logger).tool);
+		}
+
+		const tools = baseTools;
 
 		this.toolMap = new Map(tools.map((toolInstance) => [toolInstance.name, toolInstance]));
 
@@ -246,11 +310,7 @@ export class DiscoverySubgraph extends BaseSubgraph<
 			schema: discoveryOutputSchema,
 		});
 
-		// Generate prompt based on feature flags
-		const discoveryPrompt = buildDiscoveryPrompt({
-			includeExamples,
-			includeQuestions: includePlanMode,
-		});
+		const discoveryPrompt = buildDiscoveryPrompt();
 
 		// Create agent with tools bound (including submit tool)
 		const systemPrompt = ChatPromptTemplate.fromMessages([
@@ -279,7 +339,10 @@ export class DiscoverySubgraph extends BaseSubgraph<
 		this.agent = systemPrompt.pipe(config.llm.bindTools(allTools));
 		this.plannerAgent = createPlannerAgent({
 			llm: config.plannerLLM,
-			tools: [createGetDocumentationTool().tool],
+			tools: [
+				createGetDocumentationTool().tool,
+				createWebFetchTool(plannerSecurityFactory, ssrf).tool,
+			],
 		});
 
 		// Build the subgraph
@@ -334,9 +397,15 @@ export class DiscoverySubgraph extends BaseSubgraph<
 		state: typeof DiscoverySubgraphState.State,
 		runnableConfig?: RunnableConfig,
 	) {
-		if (!this.featureFlags?.planMode || state.mode !== 'plan' || state.planOutput) {
+		if (state.mode !== 'plan' || state.planOutput) {
 			return {};
 		}
+
+		// Seed planner web_fetch state from discovery state so previously approved domains carry over
+		this.plannerWebFetchState.approvedDomains = [...(state.approvedDomains ?? [])];
+		this.plannerWebFetchState.allDomainsApproved = state.allDomainsApproved ?? false;
+		this.plannerWebFetchState.webFetchCount = state.webFetchCount ?? 0;
+		this.plannerWebFetchState.messages = state.messages ?? [];
 
 		const result = await invokePlannerNode(
 			this.plannerAgent,
@@ -349,19 +418,26 @@ export class DiscoverySubgraph extends BaseSubgraph<
 				workflowJSON: state.workflowJSON,
 				planPrevious: state.planPrevious,
 				planFeedback: state.planFeedback,
+				selectedNodesContext: state.selectedNodesContext,
 			},
 			runnableConfig,
 		);
 
+		// Propagate planner's accumulated web_fetch approvals back to discovery state
+		const webFetchUpdates = {
+			approvedDomains: this.plannerWebFetchState.approvedDomains,
+			allDomainsApproved: this.plannerWebFetchState.allDomainsApproved,
+			webFetchCount: this.plannerWebFetchState.webFetchCount,
+		};
+
 		if (result.planDecision === 'modify') {
-			return { ...result, planModifyCount: state.planModifyCount + 1 };
+			return { ...result, ...webFetchUpdates, planModifyCount: state.planModifyCount + 1 };
 		}
 
-		return result;
+		return { ...result, ...webFetchUpdates };
 	}
 
 	private shouldPlan(state: typeof DiscoverySubgraphState.State): 'planner' | typeof END {
-		if (!this.featureFlags?.planMode) return END;
 		if (state.mode !== 'plan') return END;
 		return state.planOutput ? END : 'planner';
 	}
@@ -653,8 +729,17 @@ export class DiscoverySubgraph extends BaseSubgraph<
 		contextParts.push(userRequest);
 		contextParts.push('</user_request>');
 
-		// 2. Current workflow summary (just node names, to know what exists)
-		// Discovery doesn't need full JSON, just awareness of existing nodes
+		const selectedNodesSummary = buildSelectedNodesSummary(parentState.workflowContext);
+		if (selectedNodesSummary) {
+			contextParts.push('=== SELECTED NODES ===');
+			contextParts.push('<selected_nodes>');
+			contextParts.push(selectedNodesSummary);
+			contextParts.push(
+				'When user says "add X before/after this", find nodes that work well with the selected node(s).',
+			);
+			contextParts.push('</selected_nodes>');
+		}
+
 		if (parentState.workflowJSON.nodes.length > 0) {
 			contextParts.push('<existing_workflow_summary>');
 			contextParts.push(buildWorkflowSummary(parentState.workflowJSON));
@@ -672,8 +757,12 @@ export class DiscoverySubgraph extends BaseSubgraph<
 			planDecision: null,
 			planFeedback: parentState.planFeedback ?? null,
 			planPrevious: parentState.planPrevious ?? null,
+			selectedNodesContext: selectedNodesSummary ?? '',
 			messages: [contextMessage], // Context already in messages
 			cachedTemplates: parentState.cachedTemplates,
+			approvedDomains: parentState.approvedDomains ?? [],
+			allDomainsApproved: parentState.allDomainsApproved ?? false,
+			webFetchCount: 0, // Reset per-turn
 		};
 	}
 
@@ -683,9 +772,16 @@ export class DiscoverySubgraph extends BaseSubgraph<
 	) {
 		const nodesFound = subgraphOutput.nodesFound || [];
 		const templateIds = subgraphOutput.templateIds || [];
+
+		// Read fetched URL content from state field (populated by web_fetch tool)
+		const fetchedUrlContent = subgraphOutput.fetchedUrlContent?.length
+			? subgraphOutput.fetchedUrlContent
+			: undefined;
+
 		const discoveryContext: DiscoveryContext = {
 			nodesFound,
 			bestPractices: subgraphOutput.bestPractices,
+			...(fetchedUrlContent ? { fetchedUrlContent } : {}),
 		};
 
 		// Create coordination log entry (not a message)
@@ -701,6 +797,10 @@ export class DiscoverySubgraph extends BaseSubgraph<
 			}),
 		};
 
+		// Extract tool-related messages for persistence (skip the first context message).
+		// This allows the frontend to restore UI state after page refresh.
+		const toolMessages = extractToolMessagesForPersistence(subgraphOutput.messages);
+
 		// If the modify-loop cap was reached, the subgraph exited with the
 		// last plan but planDecision is still 'modify'. Clear it so the
 		// parent router doesn't send the flow back to discovery again,
@@ -708,6 +808,9 @@ export class DiscoverySubgraph extends BaseSubgraph<
 		const cappedModify =
 			subgraphOutput.planDecision === 'modify' &&
 			subgraphOutput.planModifyCount >= DiscoverySubgraph.MAX_PLAN_MODIFY_ITERATIONS;
+
+		// Extract introspection events from subgraph messages
+		const introspectionEvents = extractIntrospectionEventsFromMessages(subgraphOutput.messages);
 
 		return {
 			discoveryContext,
@@ -721,6 +824,12 @@ export class DiscoverySubgraph extends BaseSubgraph<
 			planFeedback: subgraphOutput.planFeedback,
 			planPrevious: subgraphOutput.planPrevious,
 			...(subgraphOutput.mode ? { mode: subgraphOutput.mode } : {}),
+			introspectionEvents,
+			// Include tool messages for persistence to restore frontend state on refresh
+			messages: toolMessages,
+			// Propagate web_fetch security state back to parent
+			approvedDomains: subgraphOutput.approvedDomains ?? [],
+			allDomainsApproved: subgraphOutput.allDomainsApproved ?? false,
 		};
 	}
 }

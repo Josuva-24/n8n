@@ -1,15 +1,25 @@
 import type { SourceControlledFile } from '@n8n/api-types';
-import { Logger, isContainedWithin, safeJoinPath } from '@n8n/backend-common';
+import { isContainedWithin, Logger, safeJoinPath } from '@n8n/backend-common';
 import type { TagEntity, WorkflowTagMapping } from '@n8n/db';
 import { Container } from '@n8n/di';
 import { generateKeyPairSync } from 'crypto';
-import { constants as fsConstants, mkdirSync, accessSync } from 'fs';
-import { jsonParse, UserError, type DataTableColumnType } from 'n8n-workflow';
+import { accessSync, constants as fsConstants, mkdirSync } from 'fs';
+import chunk from 'lodash/chunk';
+import isEqual from 'lodash/isEqual';
+import {
+	deepCopy,
+	jsonParse,
+	UserError,
+	type CredentialInformation,
+	type DataTableColumnType,
+	type ICredentialDataDecryptedObject,
+} from 'n8n-workflow';
 import { ok } from 'node:assert/strict';
 import { readFile as fsReadFile } from 'node:fs/promises';
 import path from 'path';
 
 import { License } from '@/license';
+import { containsExpression } from '@/utils';
 
 import {
 	SOURCE_CONTROL_FOLDERS_EXPORT_FILE,
@@ -17,20 +27,132 @@ import {
 	SOURCE_CONTROL_TAGS_EXPORT_FILE,
 	SOURCE_CONTROL_VARIABLES_EXPORT_FILE,
 } from './constants';
-import type { ExportedFolders } from './types/exportable-folders';
-import type { KeyPair } from './types/key-pair';
-import type { KeyPairType } from './types/key-pair-type';
-import type { SourceControlWorkflowVersionId } from './types/source-control-workflow-version-id';
-import type { RemoteResourceOwner, StatusResourceOwner } from './types/resource-owner';
+import type { StatusExportableCredential } from './types/exportable-credential';
 import type {
 	ExportableDataTable,
 	ExportableDataTableColumn,
 	StatusExportableDataTable,
 } from './types/exportable-data-table';
-import type { StatusExportableCredential } from './types/exportable-credential';
+import type { ExportedFolders } from './types/exportable-folders';
+import type { KeyPair } from './types/key-pair';
+import type { KeyPairType } from './types/key-pair-type';
+import type { RemoteResourceOwner, StatusResourceOwner } from './types/resource-owner';
+import type { SourceControlWorkflowVersionId } from './types/source-control-workflow-version-id';
 
-export function stringContainsExpression(testString: string): boolean {
-	return /^=.*\{\{.*\}\}/.test(testString);
+export function sanitizeCredentialData(
+	data: ICredentialDataDecryptedObject,
+): ICredentialDataDecryptedObject {
+	const result: ICredentialDataDecryptedObject = deepCopy(data);
+
+	for (const [key, value] of Object.entries(data)) {
+		if (value === null || key === 'oauthTokenData') {
+			// `oauthTokenData` is not synchable to force the pulling instance to reconnect
+			delete result[key];
+		} else if (typeof value === 'object') {
+			result[key] = sanitizeCredentialData(value as ICredentialDataDecryptedObject);
+		} else if (typeof value === 'string') {
+			result[key] = containsExpression(value) ? value : '';
+		}
+
+		// NOTE: number and boolean values are synchable for backward compatibility
+		// Typically numbers represent PORT numbers or other numeric values that aren't sensitives
+		// Boolean are usually represent non sensitive flags
+		// This could be revisited in the future
+	}
+
+	return result;
+}
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+	return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+/**
+ * Recursively merges a single value based on its type.
+ * Handles strings, numbers, booleans, arrays, and plain objects.
+ */
+function mergeSingleValue(sanitizedRemoteValue: unknown, localValue: unknown): unknown {
+	if (typeof sanitizedRemoteValue === 'string') {
+		if (containsExpression(sanitizedRemoteValue)) {
+			return sanitizedRemoteValue;
+		} else if (localValue !== undefined && localValue !== null) {
+			// Local value is preserved if it exists (secret handling)
+			return localValue;
+		}
+
+		// The remote field exists as an empty string (key is part of the schema)
+		// but local has no value for it. Preserve the empty string so the field
+		// is not silently dropped from the merged credential.
+		return '';
+	}
+
+	if (typeof sanitizedRemoteValue === 'number' || typeof sanitizedRemoteValue === 'boolean') {
+		return sanitizedRemoteValue;
+	}
+
+	if (Array.isArray(sanitizedRemoteValue)) {
+		// Only merge by index if lengths match, otherwise array structure has changed
+		// and we can't reliably match items (could be additions/removals/reordering)
+		if (Array.isArray(localValue) && localValue.length === sanitizedRemoteValue.length) {
+			return sanitizedRemoteValue.map((sanitizedItem, index) => {
+				const localItem = localValue[index];
+				return mergeSingleValue(sanitizedItem, localItem);
+			});
+		}
+
+		return sanitizedRemoteValue;
+	}
+
+	if (isPlainObject(sanitizedRemoteValue)) {
+		if (isPlainObject(localValue)) {
+			return mergeRemoteCrendetialDataIntoLocalCredentialData({
+				local: localValue as ICredentialDataDecryptedObject,
+				remote: sanitizedRemoteValue as ICredentialDataDecryptedObject,
+			});
+		}
+
+		return sanitizedRemoteValue;
+	}
+
+	return undefined;
+}
+
+/**
+ * Merges remote credential data into local data.
+ * Remote expressions, numbers and boolean values overwrite local values.
+ */
+export function mergeRemoteCrendetialDataIntoLocalCredentialData({
+	local,
+	remote,
+}: {
+	local: ICredentialDataDecryptedObject;
+	remote: ICredentialDataDecryptedObject;
+}): ICredentialDataDecryptedObject {
+	const merged: ICredentialDataDecryptedObject = {};
+
+	const sanitizedRemote = sanitizeCredentialData(remote);
+
+	for (const [key, sanitizedRemoteValue] of Object.entries(sanitizedRemote)) {
+		const localValue = local[key];
+		const mergedValue = mergeSingleValue(sanitizedRemoteValue, localValue);
+
+		if (mergedValue !== undefined) {
+			merged[key] = mergedValue as CredentialInformation;
+		}
+	}
+
+	// Keep local fields the remote stub does not carry. A field left at its default value
+	// is not persisted, so it never reaches the stub; an absent field carries the same
+	// "no value to give" meaning as a present-but-blank one, which is already preserved
+	// above. Without this it would be dropped on pull and reset to its default. This also
+	// covers oauthTokenData, which sanitization always strips from the remote.
+	for (const [key, localValue] of Object.entries(local)) {
+		if (!(key in sanitizedRemote)) {
+			merged[key] = localValue;
+		}
+	}
+
+	return merged;
 }
 
 export function getWorkflowExportPath(workflowId: string, workflowExportFolder: string): string {
@@ -119,6 +241,23 @@ export async function readDataTablesFromSourceControlFile(
 	}
 }
 
+/**
+ * Maps items in fixed-size batches (concurrency within a batch, batches sequential)
+ * to bound the peak memory of per-item work. Preserves input order; rejects on the
+ * first failing item, like `Promise.all`.
+ */
+export async function mapInBatches<T, R>(
+	items: T[],
+	batchSize: number,
+	fn: (item: T) => Promise<R>,
+): Promise<R[]> {
+	const results: R[] = [];
+	for (const batch of chunk(items, batchSize)) {
+		results.push(...(await Promise.all(batch.map(fn))));
+	}
+	return results;
+}
+
 export function sourceControlFoldersExistCheck(
 	folders: string[],
 	createIfNotExists = true,
@@ -148,7 +287,10 @@ export function isSourceControlLicensed() {
 }
 
 export async function generateSshKeyPair(keyType: KeyPairType) {
-	const sshpk = await import('sshpk');
+	// sshpk is CommonJS (`export =`): under nodenext, a native dynamic import only
+	// hoists some named exports onto the namespace (parsePrivateKey is missed), so
+	// read the real module.exports off `.default`.
+	const { default: sshpk } = await import('sshpk');
 	const keyPair: KeyPair = {
 		publicKey: '',
 		privateKey: '',
@@ -378,6 +520,16 @@ export function isDataTableModified(
 }
 
 /**
+ * Identity of a data table column across instances for identity adoption:
+ * columns matching by `(name, type)` adopt the incoming column id.
+ */
+export function getDataTableColumnKey(
+	column: Pick<ExportableDataTableColumn, 'name' | 'type'>,
+): string {
+	return `${column.name}:${column.type}`;
+}
+
+/**
  * Type guard to check if a string is a valid DataTableColumnType.
  */
 export function isValidDataTableColumnType(type: string): type is DataTableColumnType {
@@ -392,6 +544,21 @@ export function areSameCredentials(
 		credA.name === credB.name &&
 		credA.type === credB.type &&
 		!hasOwnerChanged(credA.ownedBy, credB.ownedBy) &&
-		Boolean(credA.isGlobal) === Boolean(credB.isGlobal)
+		Boolean(credA.isGlobal) === Boolean(credB.isGlobal) &&
+		Boolean(credA.isResolvable) === Boolean(credB.isResolvable) &&
+		Boolean(credA.resolvableAllowFallback) === Boolean(credB.resolvableAllowFallback) &&
+		!hasSynchableCredentialDataChanged(credA.data, credB.data)
 	);
+}
+
+function hasSynchableCredentialDataChanged(
+	data1: ICredentialDataDecryptedObject | undefined,
+	data2: ICredentialDataDecryptedObject | undefined,
+): boolean {
+	if (!data1 && !data2) return false;
+	if (!data1 || !data2) return true;
+
+	const sanitizedData1 = sanitizeCredentialData(data1);
+	const sanitizedData2 = sanitizeCredentialData(data2);
+	return !isEqual(sanitizedData1, sanitizedData2);
 }

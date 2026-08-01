@@ -1,5 +1,5 @@
 <script lang="ts" setup>
-import { useTelemetry } from '@/app/composables/useTelemetry';
+import { useTelemetry } from '@n8n/composables/useTelemetry';
 import { getLocalTimeZone, isToday } from '@internationalized/date';
 import type {
 	DateRange,
@@ -163,14 +163,14 @@ function isActiveRange(presetValue: number) {
 	<!-- eslint-disable vue/no-multiple-template-root -->
 	<N8nDateRangePicker v-model="range" v-model:open="open" :max-value :min-value>
 		<template #trigger>
-			<N8nButton icon="calendar" type="secondary">{{ formattedRange }}</N8nButton>
+			<N8nButton variant="subtle" icon="calendar">{{ formattedRange }}</N8nButton>
 		</template>
 		<template #presets>
 			<N8nButton
 				v-for="preset in presets"
 				:key="preset.value"
 				:class="$style.PresetButton"
-				:type="isActiveRange(preset.value) ? 'primary' : 'secondary'"
+				:variant="isActiveRange(preset.value) ? 'solid' : 'outline'"
 				size="small"
 				@click="preset.disabled ? showUpgradeModal() : setPresetRange(preset.value)"
 			>

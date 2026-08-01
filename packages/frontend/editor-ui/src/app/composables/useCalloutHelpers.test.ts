@@ -22,7 +22,7 @@ vi.mock('vue-router', () => ({
 	RouterLink: vi.fn(),
 }));
 
-vi.mock('@/app/composables/useTelemetry', () => ({
+vi.mock('@n8n/composables/useTelemetry', () => ({
 	useTelemetry: () => ({ track: mocks.track }),
 }));
 
@@ -35,11 +35,7 @@ vi.mock('@/features/settings/users/users.store', () => ({
 }));
 
 vi.mock('@/app/stores/workflows.store', () => ({
-	useWorkflowsStore: () => ({
-		workflowObject: {
-			id: '1',
-		},
-	}),
+	useWorkflowsStore: () => ({}),
 }));
 
 vi.mock('@/app/stores/workflowsList.store', () => ({

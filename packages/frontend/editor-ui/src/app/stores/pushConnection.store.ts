@@ -3,7 +3,8 @@ import { computed, ref, watch } from 'vue';
 import type { PushMessage } from '@n8n/api-types';
 
 import { STORES } from '@n8n/stores';
-import { DEBOUNCE_TIME, getDebounceTime } from '@/app/constants/durations';
+import { getDebounceTime } from '@n8n/composables/useDebounce';
+import { DEBOUNCE_TIME } from '@/app/constants/durations';
 import { useSettingsStore } from './settings.store';
 import { useRootStore } from '@n8n/stores/useRootStore';
 import { useWebSocketClient } from '@/app/push-connection/useWebSocketClient';
@@ -77,15 +78,17 @@ export const usePushConnectionStore = defineStore(STORES.PUSH, () => {
 			return;
 		}
 
-		onMessageReceivedHandlers.value.forEach((handler) => handler(parsedData));
+		onMessageReceivedHandlers.value.forEach((handler) => {
+			handler(parsedData);
+		});
 	}
 
-	const url = getConnectionUrl();
+	const url = computed(() => getConnectionUrl());
 
 	const client = computed(() =>
 		useWebSockets.value
-			? useWebSocketClient({ url, onMessage })
-			: useEventSourceClient({ url, onMessage }),
+			? useWebSocketClient({ url: url.value, onMessage })
+			: useEventSourceClient({ url: url.value, onMessage }),
 	);
 
 	function serializeAndSend(message: unknown) {
